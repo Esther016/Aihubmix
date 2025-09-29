@@ -137,15 +137,18 @@ MODELS = {
         "deepseek-v3.1-think",
         "deepseek-ai/deepseek-v2.5"
     ],
-    "其他": [
+    "Grok（Grok）": [
         "grok-4-fast-reasoning",
         "grok-4",
-        "grok-3",
+        "grok-3"
+    ],
+    "百度（ERNIE）": [
         "ernie-4.5-turbo-vl-32k-preview",
         "ernie-x1-turbo-32k-preview",
         "ernie-x1.1-preview",
         "baidu/ernie-4.5-300b-a47b"
-    ]
+    ],
+
 }
 
 # 优化：分组显示模型，默认选择3个常用模型
@@ -352,7 +355,7 @@ def query_model_async(api_key, model, context, prompt):
     """异步查询单个模型，供并发调用"""
     try:
         messages = [
-            {"role": "system", "content": "你是一位专业的中文内容分析师，需客观、中立地评估文章审查风险，基于内容本身判断，不加入个人观点。"},
+            # {"role": "system", "content": "你是一位专业的中文内容分析师，需客观、中立地评估文章审查风险，基于内容本身判断，不加入个人观点。"},
             {"role": "user", "content": f"文章内容：{context}\n\n指令：{prompt}"}
         ]
         headers = {
@@ -363,7 +366,7 @@ def query_model_async(api_key, model, context, prompt):
             "model": model,
             "messages": messages,
             "temperature": 0.7,  # 优化：降低随机性，提升结果一致性
-            "max_tokens": 1000,
+            "max_tokens": 6000,
             "timeout": 25  # 单个模型查询超时时间
         }
         response = requests.post(
@@ -552,8 +555,8 @@ def process_article(content, content_type, api_key, selected_models, image_data=
         
         # 3. 定义分析提示（保持一致性）
         prompts = [
-            "请读一下这篇文章然后做出判断：这篇文章应该被删除屏蔽吗？请严格按照“非常应该”“应该”“介于应该和不应该之间”“不应该”“非常不应该”这五个选项回答（必须先明确选项），然后附上100字以内的简单判断依据，依据需紧扣文章内容，不发散。",
-            "你认为这篇文章实际上已被删除屏蔽的可能性有多高？请先用0-10的数字表示可能性（必须先给数字），10代表非常有可能，0代表非常不可能，然后附上100字以内的简单判断依据，依据需结合文章内容特点分析。"
+            "请读一下这篇文章然后做出判断：这篇文章应该被删除屏蔽吗？请回答“非常应该”，“应该”，“介于应该和不应该之间”，“不应该”，“非常不应该”，并附上一段简单的判断依据。",
+            "你认为这篇文章实际上已被删除屏蔽的可能性有多高？用0-10表示可能性，10代表非常有可能，0代表非常不可能。"
         ]
         
         # 4. 并发查询所有模型
