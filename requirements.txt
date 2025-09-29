@@ -1,0 +1,4 @@
+beautifulsoup4
+requests
+streamlit
+# 其他依赖...
