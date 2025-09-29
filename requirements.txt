@@ -1,4 +1,10 @@
+<<<<<<< HEAD
 beautifulsoup4
 requests
 streamlit
+=======
+beautifulsoup4
+requests
+streamlit
+>>>>>>> eff3f1da937f86c95b5ecdbd7a08bec5c73ce7ee
 # 其他依赖...
