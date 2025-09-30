@@ -119,14 +119,56 @@ def call_provider(api_url: str, api_key: str, models: list[str], context: str, p
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     results = {}
     for m in models:
-        payload = {"model": m, "messages": messages, "temperature": 1.0, "max_tokens": 6000}
+        # Adjust parameters based on provider
+        payload = {
+            "model": m, 
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": 4096
+        }
+        
+        # Some models may need specific adjustments
+        if "gpt-4" in m or "gpt-3.5" in m:
+            payload["max_tokens"] = 4096
+        elif "claude" in m:
+            payload["max_tokens"] = 4096
+        
         try:
-            resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
+            resp = requests.post(api_url, headers=headers, json=payload, timeout=60)
             resp.raise_for_status()
             data = resp.json()
-            content = data['choices'][0]['message']['content'].strip()
+            
+            # Extract content safely
+            if 'choices' in data and len(data['choices']) > 0:
+                content = data['choices'][0]['message']['content'].strip()
+            elif 'content' in data:
+                content = data['content'].strip()
+            else:
+                content = f"Error: Unexpected response format: {data}"
+                
+        except requests.exceptions.HTTPError as e:
+            # Detailed error information
+            error_msg = f"HTTP {e.response.status_code} Error"
+            try:
+                error_detail = e.response.json()
+                if 'error' in error_detail:
+                    if isinstance(error_detail['error'], dict):
+                        error_msg += f": {error_detail['error'].get('message', str(error_detail['error']))}"
+                    else:
+                        error_msg += f": {error_detail['error']}"
+            except:
+                error_msg += f": {e.response.text[:200]}"
+            content = error_msg
+            
+        except requests.exceptions.Timeout:
+            content = "Error: Request timed out (60s). The model may be overloaded."
+            
+        except requests.exceptions.RequestException as e:
+            content = f"Error: Network error - {str(e)}"
+            
         except Exception as e:
-            content = f"Error: {e}"
+            content = f"Error: {type(e).__name__} - {str(e)}"
+        
         results[m] = content
     return results
 
