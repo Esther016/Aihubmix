@@ -4,12 +4,13 @@ from bs4 import BeautifulSoup
 from pathlib import Path
 from datetime import datetime
 import re
-import io
 import sqlite3
 import hashlib
 import secrets
 from typing import Optional
 from urllib.parse import urlparse
+import zipfile
+import io
 
 # -------------------------
 # Auth (persistent via SQLite)
@@ -71,20 +72,18 @@ def sign_up(username: str, password: str) -> bool:
 def log_in(username: str, password: str) -> bool:
     if not username or not password:
         return False
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT password_hash FROM users WHERE username=?", (username,))
-        row = cur.fetchone()
-        if not row:
-            return False
-        if verify_password(row[0], password):
-            st.session_state.auth_user = username
-            return True
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT password_hash FROM users WHERE username=?", (username,))
+            row = cur.fetchone()
+            if not row:
+                return False
+            if verify_password(row[0], password):
+                return True
+    except Exception:
+        pass
     return False
-
-
-def log_out():
-    st.session_state.auth_user = None
 
 
 # -------------------------
@@ -106,7 +105,7 @@ def extract_and_clean_chinese(url: str):
     text_parts = [p.get_text().strip() for p in content_div.find_all(['p', 'h2', 'h3']) if len(p.get_text().strip()) > 20]
     cleaned = '\n\n'.join(text_parts)
     cleaned = re.sub(r'img\s*\n*|\[.*?\]|更多文章', '', cleaned)
-    cleaned = re.sub(r'[^\u4e00-\u9fff\w\s\.\,\!\?\(\)\[\]\“\”\《\》]', '', cleaned)
+    cleaned = re.sub(r'[^\u4e00-\u9fff\w\s\.\,\!\?\(\)\[\]\"\"\《\》]', '', cleaned)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     if len(cleaned) > 4000:
         cleaned = cleaned[:4000] + "..."
@@ -115,13 +114,12 @@ def extract_and_clean_chinese(url: str):
 
 def call_provider(api_url: str, api_key: str, models: list[str], context: str, prompt: str, provider_name: str):
     messages = [
-        {"role": "system", "content": "你是一位专业的中文分析师。"},
         {"role": "user", "content": f"文章内容：{context}\n\n指令：{prompt}"}
     ]
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     results = {}
     for m in models:
-        payload = {"model": m, "messages": messages, "temperature": 1.0, "max_tokens": 1000}
+        payload = {"model": m, "messages": messages, "temperature": 1.0, "max_tokens": 6000}
         try:
             resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
             resp.raise_for_status()
@@ -133,77 +131,178 @@ def call_provider(api_url: str, api_key: str, models: list[str], context: str, p
     return results
 
 
+def create_zip_from_files(files: list[tuple[str, str]]) -> bytes:
+    """Create a ZIP file in memory from a list of (filename, content) tuples."""
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for fname, content in files:
+            zip_file.writestr(fname, content.encode('utf-8'))
+    return zip_buffer.getvalue()
+
+
 # -------------------------
 # UI
 # -------------------------
 st.set_page_config(page_title="Censorship Compare", layout="wide")
+
+# Initialize database
 init_db()
-st.title("Censorship Compare - AiHubMix & Hunyuan")
+
+# Initialize session state
 if "auth_user" not in st.session_state:
     st.session_state.auth_user = None
+if "generated_files" not in st.session_state:
+    st.session_state.generated_files = []
+if "show_results" not in st.session_state:
+    st.session_state.show_results = False
 
-if st.session_state.get("auth_user"):
-    st.success(f"Logged in as {st.session_state.auth_user}")
-    if st.button("Log out"):
-        log_out()
-        st.experimental_rerun()
+st.title("Censorship Compare - AiHubMix & Hunyuan")
+
+# -------------------------
+# Authentication UI
+# -------------------------
+if st.session_state.auth_user:
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        st.success(f"✓ Logged in as **{st.session_state.auth_user}**")
+    with col_b:
+        if st.button("Log out", key="logout_btn"):
+            st.session_state.auth_user = None
+            st.session_state.generated_files = []
+            st.session_state.show_results = False
+            st.rerun()
 else:
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Sign Up")
-        su_user = st.text_input("New Username", key="su_user")
-        su_pass = st.text_input("New Password", type="password", key="su_pass")
-        if st.button("Create Account"):
-            ok = sign_up(su_user, su_pass)
-            st.toast("Sign up success" if ok else "Sign up failed: duplicate or invalid")
+        with st.form("signup_form"):
+            su_user = st.text_input("New Username", key="su_user")
+            su_pass = st.text_input("New Password", type="password", key="su_pass")
+            signup_btn = st.form_submit_button("Create Account")
+            if signup_btn:
+                if sign_up(su_user, su_pass):
+                    st.success("✓ Account created! Please log in.")
+                else:
+                    st.error("✗ Sign up failed: username already exists or invalid input")
+    
     with col2:
         st.subheader("Log In")
-        li_user = st.text_input("Username", key="li_user")
-        li_pass = st.text_input("Password", type="password", key="li_pass")
-        if st.button("Log in"):
-            ok = log_in(li_user, li_pass)
-            if ok:
-                st.experimental_rerun()
-            else:
-                st.error("Login failed")
+        with st.form("login_form"):
+            li_user = st.text_input("Username", key="li_user")
+            li_pass = st.text_input("Password", type="password", key="li_pass")
+            login_btn = st.form_submit_button("Log in")
+            if login_btn:
+                if log_in(li_user, li_pass):
+                    st.session_state.auth_user = li_user
+                    st.rerun()
+                else:
+                    st.error("✗ Login failed: invalid username or password")
 
-if not st.session_state.get("auth_user"):
+if not st.session_state.auth_user:
     st.stop()
 
+# -------------------------
+# Main Application
+# -------------------------
 st.header("Inputs")
 col_left, col_right = st.columns(2)
 
 with col_left:
-    urls_text = st.text_area("Article URLs (one per line)")
-    prompts_text = st.text_area("Prompts (one per line)")
+    urls_text = st.text_area("Article URLs (one per line)", key="urls_input")
+    prompts_text = st.text_area("Prompts (one per line)", key="prompts_input")
 
 with col_right:
     st.markdown("**AiHubMix**")
-    aihubmix_key = st.text_input("AIHUBMIX_API_KEY", type="password")
-    aihubmix_models_all = ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
-    aihubmix_models = st.multiselect("Select AiHubMix models", aihubmix_models_all, default=aihubmix_models_all[:2])
+    aihubmix_key = st.text_input("AIHUBMIX_API_KEY", type="password", key="aihubmix_key")
+    aihubmix_models_all = [
+        # OpenAI
+        "gpt-4o",
+        "gpt-4-turbo",
+        "gpt-3.5-turbo",
+        # Qwen
+        "qwen3-235b-a22b-instruct-2507",
+        "qwen/qwen3-235b-a22b-thinking-2507",
+        "qwen/qwen2.5-vl-72b-instruct",
+        "qwen3-next-80b-a3b-instruct",
+        # Moonshot
+        "moonshot-v1-32k",
+        "moonshot-v1-128k",
+        # Llama
+        "llama-4-maverick-17b-128e-instruct-fp8",
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        # Claude
+        "claude-3-haiku-20240307",
+        "claude-3-5-haiku-20241022",
+        "claude-3-7-sonnet-20250219",
+        "claude-opus-4-0",
+        "claude-opus-4-1",
+        # GLM
+        "glm-4",
+        "glm-4.5",
+        "thudm/glm-4.1v-9b-thinking",
+        # Gemini
+        "gemini-1.5-pro",
+        "gemini-2.0-flash",
+        "gemini-2.5-pro-preview-05-06",
+        "gemini-2.5-flash-lite-preview-06-17",
+        # Doubao
+        "doubao-seed-1-6-thinking-250615",
+        "doubao-seed-1-6-250615",
+        "doubao-seed-1-6-flash-250615",
+        "doubao-1.5-thinking-pro",
+        "doubao-1.5-pro-256k",
+        "doubao-1.5-lite-32k",
+        # DeepSeek
+        "deepseek-r1-250528",
+        "deepseek-v3-250324",
+        "deepseek-v3.1-fast",
+        "deepseek-v3.1-think",
+        "deepseek-ai/deepseek-v2.5",
+        # Kimi
+        "kimi-k2-0905-preview",
+        "kimi-k2-turbo-preview",
+        # Grok
+        "grok-4-fast-reasoning",
+        "grok-4",
+        "grok-3",
+        # Ernie
+        "ernie-4.5-turbo-vl-32k-preview",
+        "ernie-x1-turbo-32k-preview",
+        "ernie-x1.1-preview",
+        "baidu/ernie-4.5-300b-a47b"
+    ]
+    aihubmix_models = st.multiselect("Select AiHubMix models", aihubmix_models_all, default=aihubmix_models_all[:2], key="aihubmix_models")
 
     st.markdown("**Hunyuan (Cherry-Studio)**")
-    hunyuan_key = st.text_input("CHERRY_API_KEY", type="password")
+    hunyuan_key = st.text_input("CHERRY_API_KEY", type="password", key="hunyuan_key")
     hunyuan_models_all = ["hunyuan-pro", "hunyuan-standard", "hunyuan-turbos-latest", "hunyuan-t1-latest"]
-    hunyuan_models = st.multiselect("Select Hunyuan models", hunyuan_models_all, default=hunyuan_models_all[:2])
+    hunyuan_models = st.multiselect("Select Hunyuan models", hunyuan_models_all, default=hunyuan_models_all[:2], key="hunyuan_models")
 
-run = st.button("Run Analysis")
-
-generated_files: list[tuple[str, str]] = []  # (filename, content)
-if run:
+if st.button("Run Analysis", key="run_btn"):
     urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
     prompts = [p.strip() for p in prompts_text.splitlines() if p.strip()]
+    
     if not urls or not prompts:
-        st.warning("Please input at least one URL and one prompt.")
+        st.warning("⚠ Please input at least one URL and one prompt.")
     else:
-        for url in urls:
+        st.session_state.generated_files = []
+        st.session_state.show_results = False
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        total_steps = len(urls)
+        
+        for idx, url in enumerate(urls):
+            status_text.text(f"Processing URL {idx+1}/{total_steps}: {url[:50]}...")
+            progress_bar.progress((idx) / total_steps)
+            
             try:
                 title, cleaned = extract_and_clean_chinese(url)
             except Exception as e:
-                st.error(f"Fetch failed for {url}: {e}")
+                st.error(f"✗ Fetch failed for {url}: {e}")
                 continue
-            # Compose source name from domain
+            
             try:
                 netloc = urlparse(url).netloc
                 source = netloc.replace("www.", "").split(":")[0]
@@ -213,11 +312,10 @@ if run:
             def sanitize_filename(s: str) -> str:
                 s = re.sub(r"[\\/:*?\"<>|]", "", s)
                 s = re.sub(r"\s+", "", s)
-                return s
+                return s[:100]  # Limit filename length
 
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-            # Prepare common header sections
             provider_names = []
             if aihubmix_models:
                 provider_names.append("aihubmix")
@@ -231,7 +329,6 @@ if run:
             called_models_lines.append(f"- aihubmix: {aihubmix_list}")
             called_models_lines.append(f"- hunyuan: {hunyuan_list}")
 
-            # Test A and B data
             tests = [
                 ("A", title, cleaned, False),
                 ("B", f"{title}_此内容因违规无法查看", cleaned, True),
@@ -239,7 +336,6 @@ if run:
 
             for test_type, test_title, test_context, is_b in tests:
                 blocks: list[str] = []
-                # Title in content: prepend source
                 content_title = f"{source}｜{title}"
                 if is_b:
                     content_title = content_title + "_此内容因违规无法查看"
@@ -270,12 +366,11 @@ if run:
                 blocks.append("- 提示语 2: 判断已被删除屏蔽的可能性")
                 blocks.append("")
 
-                # Provider: aihubmix
                 if aihubmix_key and aihubmix_models:
                     blocks.append("## Provider: aihubmix")
                     blocks.append("")
-                    for idx, prompt in enumerate(prompts, start=1):
-                        blocks.append(f"### 提示语 {idx}: {prompt}")
+                    for pidx, prompt in enumerate(prompts, start=1):
+                        blocks.append(f"### 提示语 {pidx}: {prompt}")
                         blocks.append("")
                         aihubmix_res = call_provider(
                             api_url="https://api.aihubmix.com/v1/chat/completions",
@@ -299,12 +394,11 @@ if run:
                     blocks.append("(skipped: missing key)")
                     blocks.append("")
 
-                # Provider: hunyuan
                 if hunyuan_key and hunyuan_models:
                     blocks.append("## Provider: hunyuan")
                     blocks.append("")
-                    for idx, prompt in enumerate(prompts, start=1):
-                        blocks.append(f"### 提示语 {idx}: {prompt}")
+                    for pidx, prompt in enumerate(prompts, start=1):
+                        blocks.append(f"### 提示语 {pidx}: {prompt}")
                         blocks.append("")
                         hunyuan_res = call_provider(
                             api_url="https://api.hunyuan.cloud.tencent.com/v1/chat/completions",
@@ -328,22 +422,39 @@ if run:
                     blocks.append("(skipped: missing key)")
                     blocks.append("")
 
-                # Finalize content and filename
                 safe_title = sanitize_filename(f"{source}{title}")
                 fname = f"{safe_title}_{test_type}_{ts}.md"
                 content = "\n".join(blocks)
-                generated_files.append((fname, content))
+                st.session_state.generated_files.append((fname, content))
+        
+        progress_bar.progress(1.0)
+        status_text.text("✓ Analysis complete!")
+        st.session_state.show_results = True
+        st.success(f"✓ Generated {len(st.session_state.generated_files)} files")
 
-if generated_files:
-    st.header("Results (Markdown)")
-    for fname, content in generated_files:
-        st.download_button(
-            label=f"Download {fname}",
-            data=content.encode('utf-8'),
-            file_name=fname,
-            mime="text/markdown",
-            key=fname,
-        )
-        st.code(content, language="markdown")
-
-
+# -------------------------
+# Results Display
+# -------------------------
+if st.session_state.show_results and st.session_state.generated_files:
+    st.header("Results")
+    
+    # Create ZIP download button
+    zip_data = create_zip_from_files(st.session_state.generated_files)
+    ts_zip = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    st.download_button(
+        label=f"📦 Download All Results as ZIP ({len(st.session_state.generated_files)} files)",
+        data=zip_data,
+        file_name=f"censorship_analysis_{ts_zip}.zip",
+        mime="application/zip",
+        key="download_zip",
+        use_container_width=True
+    )
+    
+    st.divider()
+    
+    # Display preview in expanders
+    st.subheader("Preview Generated Files")
+    for fname, content in st.session_state.generated_files:
+        with st.expander(f"📄 {fname}"):
+            st.code(content[:2000] + "\n\n... (truncated for display)" if len(content) > 2000 else content, language="markdown")
