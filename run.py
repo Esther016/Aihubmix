@@ -5,31 +5,80 @@ from pathlib import Path
 from datetime import datetime
 import re
 import io
+import sqlite3
+import hashlib
+import secrets
+from typing import Optional
 
 # -------------------------
-# Simple in-memory auth demo
+# Auth (persistent via SQLite)
 # -------------------------
-if "users" not in st.session_state:
-    st.session_state.users = {}
-if "auth_user" not in st.session_state:
-    st.session_state.auth_user = None
+DB_PATH = Path(__file__).with_name("auth.db")
+
+
+def get_db():
+    return sqlite3.connect(DB_PATH)
+
+
+def init_db():
+    with get_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL
+            );
+            """
+        )
+        conn.commit()
+
+
+def hash_password(password: str, salt: Optional[str] = None) -> str:
+    if salt is None:
+        salt = secrets.token_hex(16)
+    digest = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return f"{salt}${digest}"
+
+
+def verify_password(stored: str, provided_password: str) -> bool:
+    try:
+        salt, digest = stored.split("$", 1)
+    except ValueError:
+        return False
+    return hash_password(provided_password, salt) == stored
 
 
 def sign_up(username: str, password: str) -> bool:
     if not username or not password:
         return False
-    if username in st.session_state.users:
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM users WHERE username=?", (username,))
+            if cur.fetchone():
+                return False
+            cur.execute(
+                "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                (username, hash_password(password)),
+            )
+            conn.commit()
+        return True
+    except Exception:
         return False
-    st.session_state.users[username] = password
-    return True
 
 
 def log_in(username: str, password: str) -> bool:
     if not username or not password:
         return False
-    if st.session_state.users.get(username) == password:
-        st.session_state.auth_user = username
-        return True
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT password_hash FROM users WHERE username=?", (username,))
+        row = cur.fetchone()
+        if not row:
+            return False
+        if verify_password(row[0], password):
+            st.session_state.auth_user = username
+            return True
     return False
 
 
@@ -65,13 +114,13 @@ def extract_and_clean_chinese(url: str):
 
 def call_provider(api_url: str, api_key: str, models: list[str], context: str, prompt: str, provider_name: str):
     messages = [
-        # {"role": "system", "content": "你是一位专业的中文分析师。"},
+        {"role": "system", "content": "你是一位专业的中文分析师。"},
         {"role": "user", "content": f"文章内容：{context}\n\n指令：{prompt}"}
     ]
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     results = {}
     for m in models:
-        payload = {"model": m, "messages": messages, "temperature": 1.0, "max_tokens": 6000}
+        payload = {"model": m, "messages": messages, "temperature": 1.0, "max_tokens": 1000}
         try:
             resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
             resp.raise_for_status()
@@ -87,6 +136,7 @@ def call_provider(api_url: str, api_key: str, models: list[str], context: str, p
 # UI
 # -------------------------
 st.set_page_config(page_title="Censorship Compare", layout="wide")
+init_db()
 st.title("Censorship Compare - AiHubMix & Hunyuan")
 
 if st.session_state.auth_user:
@@ -127,75 +177,7 @@ with col_left:
 with col_right:
     st.markdown("**AiHubMix**")
     aihubmix_key = st.text_input("AIHUBMIX_API_KEY", type="password")
-    aihubmix_models_all = [
-    # OpenAI
-    "gpt-4o",
-    "gpt-4-turbo",
-    "gpt-3.5-turbo"
-    
-    # Qwen（阿里通义千问）
-    "qwen3-235b-a22b-instruct-2507",
-    "qwen/qwen3-235b-a22b-thinking-2507",
-    "qwen/qwen2.5-vl-72b-instruct",
-    "qwen3-next-80b-a3b-instruct",
-    
-    # Moonshot（月之暗面）
-    "moonshot-v1-32k",
-    "moonshot-v1-128k",
-    
-    # Llama（Meta）
-    "llama-4-maverick-17b-128e-instruct-fp8",
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    
-    # Claude（Anthropic）
-    "claude-3-haiku-20240307",
-    "claude-3-5-haiku-20241022",
-    "claude-3-7-sonnet-20250219",
-    "claude-opus-4-0",
-    "claude-opus-4-1",
-    
-    # GLM（智谱AI）
-    "glm-4",
-    "glm-4.5",
-    "thudm/glm-4.1v-9b-thinking",
-    
-    # Gemini（Google）
-    "gemini-1.5-pro",
-    "gemini-2.0-flash",
-    "gemini-2.5-pro-preview-05-06",
-    "gemini-2.5-flash-lite-preview-06-17",
-    
-    # Doubao（豆包）
-    "doubao-seed-1-6-thinking-250615",
-    "doubao-seed-1-6-250615",
-    "doubao-seed-1-6-flash-250615",
-    "doubao-1.5-thinking-pro",
-    "doubao-1.5-pro-256k",
-    "doubao-1.5-lite-32k",
-    
-    # DeepSeek（深度求索）
-    "deepseek-r1-250528",
-    "deepseek-v3-250324",
-    "deepseek-v3.1-fast",
-    "deepseek-v3.1-think",
-    "deepseek-ai/deepseek-v2.5",
-    
-    # Kimi（Moonshot）
-    "kimi-k2-0905-preview",
-    "kimi-k2-turbo-preview",
-    
-    # Grok（X.AI）
-    "grok-4-fast-reasoning",
-    "grok-4",
-    "grok-3",
-    
-    # Ernie（百度文心一言）
-    "ernie-4.5-turbo-vl-32k-preview",
-    "ernie-x1-turbo-32k-preview",
-    "ernie-x1.1-preview",
-    "baidu/ernie-4.5-300b-a47b"
-    ]
+    aihubmix_models_all = ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
     aihubmix_models = st.multiselect("Select AiHubMix models", aihubmix_models_all, default=aihubmix_models_all[:2])
 
     st.markdown("**Hunyuan (Cherry-Studio)**")
@@ -277,4 +259,5 @@ if results_md:
         mime="text/markdown"
     )
     st.code(results_md, language="markdown")
+
 
