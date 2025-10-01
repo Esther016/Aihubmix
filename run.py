@@ -11,6 +11,18 @@ from typing import Optional
 from urllib.parse import urlparse
 import zipfile
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import OrderedDict
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import time
+
+# -------------------------
+# Global Session for reuse
+# -------------------------
+session = requests.Session()
+retries = Retry(total=2, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+session.mount("https://", HTTPAdapter(max_retries=retries))
 
 # -------------------------
 # Auth (persistent via SQLite)
@@ -90,86 +102,90 @@ def log_in(username: str, password: str) -> bool:
 # Utilities
 # -------------------------
 def extract_and_clean_chinese(url: str):
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    response = requests.get(url, headers=headers, timeout=15)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.content, 'html.parser')
-    title_elem = soup.find('h1') or soup.find('title')
-    title = title_elem.get_text().strip() if title_elem else "Unknown Title"
-    title = re.sub(r'【404文库】|【CDT.*?】|【\w+】', '', title).strip()
-    content_div = soup.find('div', class_='entry-content') or soup.find('article')
-    if not content_div:
-        content_div = soup
-    for elem in content_div.find_all(['div', 'p', 'span'], text=re.compile(r'CDT 档案卡|编者按|CDT编辑注|相关阅读|版权说明|更多文章')):
-        elem.decompose()
-    text_parts = [p.get_text().strip() for p in content_div.find_all(['p', 'h2', 'h3']) if len(p.get_text().strip()) > 20]
-    cleaned = '\n\n'.join(text_parts)
-    cleaned = re.sub(r'img\s*\n*|\[.*?\]|更多文章', '', cleaned)
-    cleaned = re.sub(r'[^\u4e00-\u9fff\w\s\.\,\!\?\(\)\[\]\"\"\《\》]', '', cleaned)
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    if len(cleaned) > 4000:
-        cleaned = cleaned[:4000] + "..."
-    return title, cleaned
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = session.get(url, headers=headers, timeout=(5, 20))
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        title_elem = soup.find('h1') or soup.find('title')
+        title = title_elem.get_text().strip() if title_elem else "Unknown Title"
+        title = re.sub(r'【404文库】|【CDT.*?】|【\w+】', '', title).strip()
+        content_div = soup.find('div', class_='entry-content') or soup.find('article')
+        if not content_div:
+            content_div = soup
+        for elem in content_div.find_all(['div', 'p', 'span'], text=re.compile(r'CDT 档案卡|编者按|CDT编辑注|相关阅读|版权说明|更多文章')):
+            elem.decompose()
+        text_parts = [p.get_text().strip() for p in content_div.find_all(['p', 'h2', 'h3']) if len(p.get_text().strip()) > 20]
+        cleaned = '\n\n'.join(text_parts)
+        cleaned = re.sub(r'img\s*\n*|\[.*?\]|更多文章', '', cleaned)
+        cleaned = re.sub(r'[^\u4e00-\u9fff\w\s\.\,\!\?\(\)\[\]\"\"\《\》]', '', cleaned)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        if len(cleaned) > 5000:
+            cleaned = cleaned[:5000] + "..."
+        return title, cleaned
+    except Exception as e:
+        return "Error Title", f"网页抓取失败: {str(e)}"
 
 
-def call_provider(api_url: str, api_key: str, models: list[str], context: str, prompt: str, provider_name: str):
-    messages = [
-        {"role": "user", "content": f"文章内容：{context}\n\n指令：{prompt}"}
-    ]
+def query_single_model(api_url: str, api_key: str, model: str, context: str, prompt: str, max_retries: int = 2):
+    """Query a single model with retry mechanism"""
+    messages = [{"role": "user", "content": f"文章内容：{context}\n\n指令：{prompt}"}]
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    results = {}
-    for m in models:
-        # Adjust parameters based on provider
-        payload = {
-            "model": m, 
-            "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": 4096
-        }
-        
-        # Some models may need specific adjustments
-        if "gpt-4" in m or "gpt-3.5" in m:
-            payload["max_tokens"] = 4096
-        elif "claude" in m:
-            payload["max_tokens"] = 4096
-        
+    
+    # Special handling for different model types
+    models_need_max_completion = ["gpt-5", "gpt-5-mini", "o3", "o4-mini"]
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.8,
+    }
+    
+    if model in models_need_max_completion:
+        payload["max_completion_tokens"] = 800
+    else:
+        payload["max_tokens"] = 800
+    
+    backoff = 2
+    for retry in range(max_retries + 1):
         try:
-            resp = requests.post(api_url, headers=headers, json=payload, timeout=60)
+            start = time.perf_counter()
+            resp = session.post(api_url, headers=headers, json=payload, timeout=(5, 25))
             resp.raise_for_status()
             data = resp.json()
             
-            # Extract content safely
             if 'choices' in data and len(data['choices']) > 0:
                 content = data['choices'][0]['message']['content'].strip()
             elif 'content' in data:
                 content = data['content'].strip()
             else:
                 content = f"Error: Unexpected response format: {data}"
-                
-        except requests.exceptions.HTTPError as e:
-            # Detailed error information
-            error_msg = f"HTTP {e.response.status_code} Error"
-            try:
-                error_detail = e.response.json()
-                if 'error' in error_detail:
-                    if isinstance(error_detail['error'], dict):
-                        error_msg += f": {error_detail['error'].get('message', str(error_detail['error']))}"
-                    else:
-                        error_msg += f": {error_detail['error']}"
-            except:
-                error_msg += f": {e.response.text[:200]}"
-            content = error_msg
             
-        except requests.exceptions.Timeout:
-            content = "Error: Request timed out (60s). The model may be overloaded."
-            
-        except requests.exceptions.RequestException as e:
-            content = f"Error: Network error - {str(e)}"
+            elapsed = time.perf_counter() - start
+            return model, content
             
         except Exception as e:
-            content = f"Error: {type(e).__name__} - {str(e)}"
+            if retry < max_retries:
+                time.sleep(backoff)
+                backoff *= 2
+            else:
+                return model, f"模型 {model} 调用失败: {str(e)}"
+
+
+def call_provider_concurrent(api_url: str, api_key: str, models: list[str], context: str, prompt: str, provider_name: str):
+    """Call multiple models concurrently for a single prompt"""
+    results = OrderedDict((m, "未响应") for m in models)
+    
+    max_workers = min(8, len(models))  # Limit concurrent requests
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(query_single_model, api_url, api_key, m, context, prompt): m 
+            for m in models
+        }
         
-        results[m] = content
+        for future in as_completed(futures):
+            model, response = future.result()
+            results[model] = response
+    
     return results
 
 
@@ -258,19 +274,23 @@ with col_right:
     aihubmix_key = st.text_input("AIHUBMIX_API_KEY", type="password", key="aihubmix_key")
     aihubmix_models_all = [
         # OpenAI
+        "gpt-5",
+        "gpt-5-mini",
+        "o3",
+        "o4-mini",
         "gpt-4o",
         "gpt-4-turbo",
         "gpt-3.5-turbo",
         # Qwen
-        "qwen3-235b-a22b-instruct-2507",
-        "qwen/qwen3-235b-a22b-thinking-2507",
-        "qwen/qwen2.5-vl-72b-instruct",
-        "qwen3-next-80b-a3b-instruct",
+        "Qwen3-235B-A22B-Instruct-2507",
+        "Qwen/Qwen3-235B-A22B-Thinking-2507",
+        "Qwen/Qwen2.5-VL-72B-Instruct",
+        "Qwen3-Next-80B-A3B-Instruct",
         # Moonshot
         "moonshot-v1-32k",
         "moonshot-v1-128k",
         # Llama
-        "llama-4-maverick-17b-128e-instruct-fp8",
+        "Llama-4-Maverick-17B-128E-Instruct-FP8",
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",
         # Claude
@@ -282,25 +302,22 @@ with col_right:
         # GLM
         "glm-4",
         "glm-4.5",
-        "thudm/glm-4.1v-9b-thinking",
+        "THUDM/GLM-4.1V-9B-Thinking",
         # Gemini
-        "gemini-1.5-pro",
         "gemini-2.0-flash",
         "gemini-2.5-pro-preview-05-06",
         "gemini-2.5-flash-lite-preview-06-17",
         # Doubao
-        "doubao-seed-1-6-thinking-250615",
         "doubao-seed-1-6-250615",
         "doubao-seed-1-6-flash-250615",
-        "doubao-1.5-thinking-pro",
-        "doubao-1.5-pro-256k",
-        "doubao-1.5-lite-32k",
+        "Doubao-1.5-thinking-pro",
+        "Doubao-1.5-pro-256k",
+        "Doubao-1.5-lite-32k",
         # DeepSeek
         "deepseek-r1-250528",
         "deepseek-v3-250324",
-        "deepseek-v3.1-fast",
-        "deepseek-v3.1-think",
-        "deepseek-ai/deepseek-v2.5",
+        "DeepSeek-V3.1-Fast",
+        "deepseek-ai/DeepSeek-V2.5",
         # Kimi
         "kimi-k2-0905-preview",
         "kimi-k2-turbo-preview",
@@ -312,7 +329,7 @@ with col_right:
         "ernie-4.5-turbo-vl-32k-preview",
         "ernie-x1-turbo-32k-preview",
         "ernie-x1.1-preview",
-        "baidu/ernie-4.5-300b-a47b"
+        "baidu/ERNIE-4.5-300B-A47B"
     ]
     aihubmix_models = st.multiselect("Select AiHubMix models", aihubmix_models_all, default=aihubmix_models_all[:2], key="aihubmix_models")
 
@@ -414,7 +431,7 @@ if st.button("Run Analysis", key="run_btn"):
                     for pidx, prompt in enumerate(prompts, start=1):
                         blocks.append(f"### 提示语 {pidx}: {prompt}")
                         blocks.append("")
-                        aihubmix_res = call_provider(
+                        aihubmix_res = call_provider_concurrent(
                             api_url="https://api.aihubmix.com/v1/chat/completions",
                             api_key=aihubmix_key,
                             models=aihubmix_models,
@@ -430,6 +447,8 @@ if st.button("Run Analysis", key="run_btn"):
                             blocks.append("")
                             blocks.append("---")
                             blocks.append("")
+                        # Small delay between prompts
+                        time.sleep(1)
                 elif aihubmix_models:
                     blocks.append("## Provider: aihubmix")
                     blocks.append("")
@@ -442,7 +461,7 @@ if st.button("Run Analysis", key="run_btn"):
                     for pidx, prompt in enumerate(prompts, start=1):
                         blocks.append(f"### 提示语 {pidx}: {prompt}")
                         blocks.append("")
-                        hunyuan_res = call_provider(
+                        hunyuan_res = call_provider_concurrent(
                             api_url="https://api.hunyuan.cloud.tencent.com/v1/chat/completions",
                             api_key=hunyuan_key,
                             models=hunyuan_models,
@@ -458,6 +477,8 @@ if st.button("Run Analysis", key="run_btn"):
                             blocks.append("")
                             blocks.append("---")
                             blocks.append("")
+                        # Small delay between prompts
+                        time.sleep(1)
                 elif hunyuan_models:
                     blocks.append("## Provider: hunyuan")
                     blocks.append("")
